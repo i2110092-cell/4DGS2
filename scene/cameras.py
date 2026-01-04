@@ -62,6 +62,12 @@ class Camera(nn.Module):
         # .cuda()
         self.full_proj_transform = (self.world_view_transform.unsqueeze(0).bmm(self.projection_matrix.unsqueeze(0))).squeeze(0)
         self.camera_center = self.world_view_transform.inverse()[3, :3]
+        
+    def update_ms_features(self, kplanes, scaling, xyz, gaussians):
+        self.kplanes = kplanes
+        self.gaussian_scaling = scaling
+        self.gaussian_xyz = xyz
+        self.gaussians = gaussians
 
 class MiniCam:
     def __init__(self, width, height, fovy, fovx, znear, zfar, world_view_transform, full_proj_transform, time):
@@ -76,4 +82,3 @@ class MiniCam:
         view_inv = torch.inverse(self.world_view_transform)
         self.camera_center = view_inv[3][:3]
         self.time = time
-

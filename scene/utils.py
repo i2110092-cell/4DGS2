@@ -168,7 +168,11 @@ class Camera:
         'tangential_distortion': self.tangential_distortion,
         'image_size': self.image_size,
     }
-
+  def update_ms_features(self, kplanes, scaling, xyz, gaussians):
+      self.kplanes = kplanes
+      self.gaussian_scaling = scaling
+      self.gaussian_xyz = xyz
+      self.gaussians = gaussians
   @property
   def scale_factor_x(self):
     return self.focal_length

@@ -127,6 +127,12 @@ class GaussianModel:
     def get_opacity(self):
         return self.opacity_activation(self._opacity)
     
+    def get_current_kplanes(self):
+        if hasattr(self._deformation, "deformation_net") and hasattr(self._deformation.deformation_net, "grid"):
+            return self._deformation.deformation_net.grid.grids
+        if hasattr(self._deformation, "grid"):
+            return self._deformation.grid.grids
+        return None
     def get_covariance(self, scaling_modifier = 1):
         return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
 
