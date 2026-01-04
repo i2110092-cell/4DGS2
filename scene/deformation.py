@@ -24,7 +24,7 @@ class Deformation(nn.Module):
         self.grid_pe = grid_pe
         self.no_grid = args.no_grid
         self.grid = HexPlaneField(args.bounds, args.kplanes_config, args.multires)
-        # breakpoint()
+        
         self.args = args
         # self.args.empty_voxel=True
         if self.args.empty_voxel:
@@ -37,50 +37,43 @@ class Deformation(nn.Module):
     @property
     def get_aabb(self):
         return self.grid.get_aabb
+    
     def set_aabb(self, xyz_max, xyz_min):
         print("Deformation Net Set aabb",xyz_max, xyz_min)
         self.grid.set_aabb(xyz_max, xyz_min)
         if self.args.empty_voxel:
             self.empty_voxel.set_aabb(xyz_max, xyz_min)
+
     def create_net(self):
-        mlp_out_dim = 0
-        if self.grid_pe !=0:
-            
-            grid_out_dim = self.grid.feat_dim+(self.grid.feat_dim)*2 
-        else:
-            grid_out_dim = self.grid.feat_dim
-        if self.no_grid:
-            self.feature_out = [nn.Linear(4,self.W)]
-        else:
-            self.feature_out = [nn.Linear(mlp_out_dim + grid_out_dim ,self.W)]
-        
-        for i in range(self.D-1):
-            self.feature_out.append(nn.ReLU())
-            self.feature_out.append(nn.Linear(self.W,self.W))
-        self.feature_out = nn.Sequential(*self.feature_out)
-        self.pos_deform = nn.Sequential(nn.ReLU(),nn.Linear(self.W,self.W),nn.ReLU(),nn.Linear(self.W, 3))
-        self.scales_deform = nn.Sequential(nn.ReLU(),nn.Linear(self.W,self.W),nn.ReLU(),nn.Linear(self.W, 3))
-        self.rotations_deform = nn.Sequential(nn.ReLU(),nn.Linear(self.W,self.W),nn.ReLU(),nn.Linear(self.W, 4))
-        self.opacity_deform = nn.Sequential(nn.ReLU(),nn.Linear(self.W,self.W),nn.ReLU(),nn.Linear(self.W, 1))
-        self.shs_deform = nn.Sequential(nn.ReLU(),nn.Linear(self.W,self.W),nn.ReLU(),nn.Linear(self.W, 16*3))
+        self.feature_out = None
+        self.pos_deform = None
+        self.scales_deform = None
+        self.rotations_deform = None
+        self.opacity_deform = None
+        self.shs_deform = None
 
     def query_time(self, rays_pts_emb, scales_emb, rotations_emb, time_feature, time_emb):
 
         if self.no_grid:
-            h = torch.cat([rays_pts_emb[:,:3],time_emb[:,:1]],-1)
+            if time_emb is not None:
+                h = torch.cat([rays_pts_emb[:,:3], time_emb[:,:1]],-1)
+            else:
+                h = rays_pts_emb[:,:3]
         else:
-
-            grid_feature = self.grid(rays_pts_emb[:,:3], time_emb[:,:1])
-            # breakpoint()
+            if time_emb is None:
+                time_input = torch.zeros(
+                    (rays_pts_emb.shape[0], 1),
+                    device=rays_pts_emb.device,
+                    dtype=rays_pts_emb.dtype,
+                )
+            else:
+                time_input = time_emb[:,:1]
+            grid_feature = self.grid(rays_pts_emb[:,:3], time_input)
             if self.grid_pe > 1:
                 grid_feature = poc_fre(grid_feature,self.grid_pe)
-            hidden = torch.cat([grid_feature],-1) 
-        
-        
-        hidden = self.feature_out(hidden)   
- 
+            h = torch.cat([grid_feature],-1)
 
-        return hidden
+        return h
     @property
     def get_empty_ratio(self):
         return self.ratio
@@ -91,73 +84,128 @@ class Deformation(nn.Module):
             return self.forward_dynamic(rays_pts_emb, scales_emb, rotations_emb, opacity, shs_emb, time_feature, time_emb)
 
     def forward_static(self, rays_pts_emb):
-        grid_feature = self.grid(rays_pts_emb[:,:3])
+        if not hasattr(self, "static_mlp"):
+            return rays_pts_emb[:, :3]
+        timestamps = torch.zeros(
+            (rays_pts_emb.shape[0], 1),
+            device=rays_pts_emb.device,
+            dtype=rays_pts_emb.dtype,
+        )
+        grid_feature = self.grid(rays_pts_emb[:,:3], timestamps)
+        if grid_feature.shape[1] != self.W:
+            return rays_pts_emb[:, :3]
         dx = self.static_mlp(grid_feature)
         return rays_pts_emb[:, :3] + dx
+    
     def forward_dynamic(self,rays_pts_emb, scales_emb, rotations_emb, opacity_emb, shs_emb, time_feature, time_emb):
-        hidden = self.query_time(rays_pts_emb, scales_emb, rotations_emb, time_feature, time_emb)
-        if self.args.static_mlp:
-            mask = self.static_mlp(hidden)
-        elif self.args.empty_voxel:
-            mask = self.empty_voxel(rays_pts_emb[:,:3])
+        points = rays_pts_emb[:,:3]
+        scales_in = scales_emb[:,:3]
+        rotations_in = rotations_emb[:,:4]
+        steepness, grad_dir = self._wave_steepness(points)
+        if self.args.empty_voxel:
+            mask = self.empty_voxel(points).clamp(0, 1)
         else:
-            mask = torch.ones_like(opacity_emb[:,0]).unsqueeze(-1)
-        # breakpoint()
-        if self.args.no_dx:
-            pts = rays_pts_emb[:,:3]
-        else:
-            dx = self.pos_deform(hidden)
-            pts = torch.zeros_like(rays_pts_emb[:,:3])
-            pts = rays_pts_emb[:,:3]*mask + dx
-        if self.args.no_ds :
-            
-            scales = scales_emb[:,:3]
-        else:
-            ds = self.scales_deform(hidden)
+            mask = torch.ones_like(points[:, :1])
 
-            scales = torch.zeros_like(scales_emb[:,:3])
-            scales = scales_emb[:,:3]*mask + ds
-            
-        if self.args.no_dr :
-            rotations = rotations_emb[:,:4]
+        if steepness is None:
+            dx = torch.zeros_like(points)
+            scales = scales_in
+            rotations = rotations_in
         else:
-            dr = self.rotations_deform(hidden)
+            dx_scale = getattr(self.args, "wave_dx_scale", 0.01)
+            ds_scale = getattr(self.args, "wave_ds_scale", 0.02)
+            dr_scale = getattr(self.args, "wave_dr_scale", 0.05)
+            steep_min = steepness.min()
+            steep_max = steepness.max()
+            steep_norm = (steepness - steep_min) / (steep_max - steep_min + 1e-6)
+            steep_shift = (steep_norm - 0.5) * 2.0
+            steep_shift = steep_shift * mask.squeeze(-1)
 
-            rotations = torch.zeros_like(rotations_emb[:,:4])
-            if self.args.apply_rotation:
-                rotations = batch_quaternion_multiply(rotations_emb, dr)
+            dx = torch.zeros_like(points)
+            dx[:, 2] = dx_scale * steep_shift
+
+            if self.args.no_ds:
+                scales = scales_in
             else:
-                rotations = rotations_emb[:,:4] + dr
+                ds_delta = ds_scale * (-steep_shift).unsqueeze(-1).expand_as(scales_in)
+                scales = scales_in + ds_delta
 
-        if self.args.no_do :
-            opacity = opacity_emb[:,:1] 
+            if self.args.no_dr:
+                rotations = rotations_in
+            else:
+                angle = dr_scale * steep_shift
+                axis = torch.zeros_like(points)
+                axis[:, 0] = grad_dir[:, 1]
+                axis[:, 1] = -grad_dir[:, 0]
+                axis_norm = torch.norm(axis, dim=1, keepdim=True) + 1e-8
+                axis = axis / axis_norm
+                half_angle = angle.unsqueeze(-1) * 0.5
+                dr = torch.zeros_like(rotations_in)
+                dr[:, 0] = torch.cos(half_angle).squeeze(-1)
+                sin_half = torch.sin(half_angle)
+                dr[:, 1:] = axis * sin_half
+                if self.args.apply_rotation:
+                    rotations = batch_quaternion_multiply(rotations_in, dr)
+                else:
+                    rotations = rotations_in + dr
+
+        if self.args.no_dx:
+            pts = points
         else:
-            do = self.opacity_deform(hidden) 
-          
-            opacity = torch.zeros_like(opacity_emb[:,:1])
-            opacity = opacity_emb[:,:1]*mask + do
+            pts = points + dx
+
+        if self.args.no_do:
+            opacity = opacity_emb[:,:1]
+        else:
+            opacity = opacity_emb[:,:1]
+
         if self.args.no_dshs:
             shs = shs_emb
         else:
-            dshs = self.shs_deform(hidden).reshape([shs_emb.shape[0],16,3])
-
-            shs = torch.zeros_like(shs_emb)
-            # breakpoint()
-            shs = shs_emb*mask.unsqueeze(-1) + dshs
+            shs = shs_emb
 
         return pts, scales, rotations, opacity, shs
     def get_mlp_parameters(self):
-        parameter_list = []
-        for name, param in self.named_parameters():
-            if  "grid" not in name:
-                parameter_list.append(param)
-        return parameter_list
+        return []
     def get_grid_parameters(self):
         parameter_list = []
         for name, param in self.named_parameters():
             if  "grid" in name:
                 parameter_list.append(param)
         return parameter_list
+
+    def _wave_steepness(self, points):
+        if points.numel() == 0:
+            return None, None
+        z_vals = points[:, 2]
+        try:
+            z_thresh = torch.quantile(z_vals, 0.7)
+        except RuntimeError:
+            z_thresh = z_vals.mean()
+        surface_mask = z_vals >= z_thresh
+        if surface_mask.sum() < 6:
+            return None, None
+        x = points[surface_mask, 0]
+        y = points[surface_mask, 1]
+        z = points[surface_mask, 2]
+        design = torch.stack(
+            [x * x, y * y, x * y, x, y, torch.ones_like(x)],
+            dim=1,
+        )
+        try:
+            coeffs = torch.linalg.lstsq(design, z).solution
+        except RuntimeError:
+            coeffs = torch.zeros(6, device=points.device, dtype=points.dtype)
+            coeffs[-1] = z.mean()
+        a, b, c, d, e, _ = coeffs
+        dx = 2 * a * points[:, 0] + c * points[:, 1] + d
+        dy = 2 * b * points[:, 1] + c * points[:, 0] + e
+        grad = torch.stack([dx, dy], dim=1)
+        grad_norm = torch.norm(grad, dim=1)
+        hessian_norm = torch.sqrt((2 * a) ** 2 + (2 * b) ** 2 + 2 * (c ** 2))
+        steepness = grad_norm + 0.1 * hessian_norm
+        grad_dir = grad / (grad_norm.unsqueeze(-1) + 1e-8)
+        return steepness, grad_dir
 class deform_network(nn.Module):
     def __init__(self, args) :
         super(deform_network, self).__init__()
@@ -184,10 +232,12 @@ class deform_network(nn.Module):
 
     def forward(self, point, scales=None, rotations=None, opacity=None, shs=None, times_sel=None):
         return self.forward_dynamic(point, scales, rotations, opacity, shs, times_sel)
+    
     @property
     def get_aabb(self):
         
         return self.deformation_net.get_aabb
+    
     @property
     def get_empty_ratio(self):
         return self.deformation_net.get_empty_ratio
@@ -195,6 +245,7 @@ class deform_network(nn.Module):
     def forward_static(self, points):
         points = self.deformation_net(points)
         return points
+        
     def forward_dynamic(self, point, scales=None, rotations=None, opacity=None, shs=None, times_sel=None):
         # times_emb = poc_fre(times_sel, self.time_poc)
         point_emb = poc_fre(point,self.pos_poc)
@@ -211,7 +262,7 @@ class deform_network(nn.Module):
                                                 times_sel)
         return means3D, scales, rotations, opacity, shs
     def get_mlp_parameters(self):
-        return self.deformation_net.get_mlp_parameters() + list(self.timenet.parameters())
+        return self.deformation_net.get_mlp_parameters()
     def get_grid_parameters(self):
         return self.deformation_net.get_grid_parameters()
 

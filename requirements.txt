@@ -4,8 +4,8 @@ torchaudio==0.13.1
 mmcv==1.6.0
 matplotlib
 argparse
+numpy
 lpips
 plyfile
 pytorch_msssim
 open3d
-imageio[ffmpeg]
